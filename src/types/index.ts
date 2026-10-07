@@ -1,6 +1,9 @@
 export type TraderId = 'mehmet' | 'kemal' | 'nuri' | 'selo' | 'sevil';
 export type CharacterId = TraderId | 'cirak';
 
+export type RiskMode = 'NORMAL' | 'TEMKINLI' | 'BUZDA';
+export type MarketRegime = 'TREND_UP' | 'TREND_DOWN' | 'RANGE';
+
 export interface TraderProfile {
   id: TraderId;
   name: string;
@@ -22,6 +25,13 @@ export interface TraderProfile {
   fearLevel: number; // 0 to 100, affects risk taking
   isAggressive: boolean;
   statusText: string;
+  // Adaptive risk memory
+  riskMode: RiskMode;
+  consecutiveLosses: number;
+  lastLossTimestamp: number;
+  symbolCooldowns: Record<string, number>; // symbol -> timestamp until cooldown expires
+  creditRating: 'AAA' | 'AA' | 'A' | 'BBB' | 'CCC' | 'D';
+  expectedCollectionRate: number; // e.g. 92 for 92%
   // TTS profile
   voicePitch: number;
   voiceRate: number;
@@ -43,6 +53,24 @@ export interface IndicatorSnapshot {
   fundingRate: number;
   spikeShadowRatio: number; // (high - close) or (close - low) vs body
   volumeSurgeRatio: number; // current 1m vol / 20 period avg vol
+  atr: number; // Average True Range for dynamic stops
+  bbWidth: number; // (bbUpper - bbLower) / bbMiddle
+  spreadPercent: number; // (bestAsk - bestBid) / midPrice
+  // Real Binance Futures Data Layer
+  openInterest: number;
+  oiDelta5m: number;
+  cvd5m: number; // Cumulative Volume Delta ($)
+  cvdRatio: number; // 0 to 1 (taker buy ratio)
+  liquidationBurstSide: 'LONG' | 'SHORT' | 'NONE';
+  liquidationVolume5m: number;
+}
+
+export interface DataHealthStatus {
+  status: 'CONNECTED' | 'RECONNECTING' | 'FALLBACK_REST';
+  latencyMs: number;
+  lastMessageTime: number;
+  activeStreamsCount: number;
+  totalMessagesReceived: number;
 }
 
 export interface Position {
@@ -60,6 +88,9 @@ export interface Position {
   liquidationPrice: number;
   takeProfitPrice: number;
   stopLossPrice: number;
+  initialStopLossPrice: number;
+  initialRiskAmount: number; // $ at risk on initial stop
+  rDistance: number; // |entry - initialStop|
   unrealizedPnl: number;
   roePercent: number;
   openTime: number;
@@ -70,6 +101,12 @@ export interface Position {
   strategyReason: string;
   entryIndicators: IndicatorSnapshot;
   liquidationDistancePercent: number;
+  confidenceScore: number; // 0 - 100
+  marketRegime: MarketRegime;
+  isBreakevenSet: boolean;
+  isTrailingActive: boolean;
+  maxFavorableExcursion: number; // peak profit reached
+  maxAdverseExcursion: number; // lowest drawdown reached
 }
 
 export interface Loan {
@@ -94,6 +131,15 @@ export interface Loan {
   actionsTaken: ('THREATENED' | 'INTEREST_DOUBLED' | 'TERM_EXTENDED')[];
 }
 
+export type ExitReason =
+  | 'TAKE_PROFIT'
+  | 'STOP_LOSS'
+  | 'BREAKEVEN'
+  | 'TRAILING_STOP'
+  | 'TIME_STOP'
+  | 'LIQUIDATED'
+  | 'MARGIN_CUT';
+
 export interface DecisionLog {
   id: string;
   timestamp: number;
@@ -107,18 +153,31 @@ export interface DecisionLog {
   margin: number;
   realizedPnl: number;
   roePercent: number;
-  exitReason: 'TAKE_PROFIT' | 'STOP_LOSS' | 'LIQUIDATED' | 'MARGIN_CUT';
+  exitReason: ExitReason;
   strategyName: string;
   entryIndicators: IndicatorSnapshot;
   whyOpened: string;
   whyFailedOrWon: string;
   aiImprovementNote: string;
+  confidenceScore: number;
+  marketRegime: MarketRegime;
+  holdingDurationSeconds: number;
+  feePaid: number;
+  rMultiple: number; // PnL / initialRisk
 }
 
 export interface NewsEvent {
   id: string;
   timestamp: number;
-  type: 'LIQUIDATION' | 'LOAN_REQUEST' | 'LOAN_OVERDUE' | 'THREAT' | 'MASSIVE_PROFIT' | 'WHALE_ALERT' | 'LOAN_PAID';
+  type:
+    | 'LIQUIDATION'
+    | 'LOAN_REQUEST'
+    | 'LOAN_OVERDUE'
+    | 'THREAT'
+    | 'MASSIVE_PROFIT'
+    | 'WHALE_ALERT'
+    | 'LOAN_PAID'
+    | 'RISK_ALERT';
   speaker: CharacterId;
   speakerName: string;
   message: string;

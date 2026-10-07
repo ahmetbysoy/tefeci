@@ -1,6 +1,6 @@
-import React from 'react';
-import { Settings, Volume2, VolumeX, ShieldAlert } from 'lucide-react';
-import { soundService } from '../services/soundAndTts';
+import React, { useState, useEffect } from 'react';
+import { Settings, Volume2, VolumeX, Activity } from 'lucide-react';
+import { binanceFeed } from '../services/binanceFeed';
 
 interface HeaderBarProps {
   cashBalance: number;
@@ -21,6 +21,17 @@ export const HeaderBar: React.FC<HeaderBarProps> = ({
   soundEnabled,
   onToggleSound,
 }) => {
+  const [dataHealth, setDataHealth] = useState(() => binanceFeed.getDataHealth());
+
+  useEffect(() => {
+    const timer = setInterval(() => {
+      setDataHealth(binanceFeed.getDataHealth());
+    }, 2000);
+    return () => clearInterval(timer);
+  }, []);
+
+  const isConnected = dataHealth.status === 'CONNECTED';
+
   return (
     <header className="sticky top-0 z-30 bg-white/90 backdrop-blur-md border-b border-purple-100 shadow-xs px-3 sm:px-4 py-2.5">
       <div className="max-w-4xl mx-auto flex items-center justify-between gap-2">
@@ -30,8 +41,26 @@ export const HeaderBar: React.FC<HeaderBarProps> = ({
             ₺
           </div>
           <div>
-            <div className="font-display font-extrabold text-base tracking-tight text-slate-900 leading-tight">
-              TEFECİ
+            <div className="flex items-center gap-1.5">
+              <span className="font-display font-extrabold text-base tracking-tight text-slate-900 leading-tight">
+                TEFECİ
+              </span>
+              {/* Data Health Live Pulse */}
+              <div
+                title={`Binance Futures Public WSS (${dataHealth.activeStreamsCount} Akış: Ticker, BookTicker, MarkPrice, Kline, AggTrade, ForceOrder, OI)`}
+                className={`hidden sm:inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md text-[9px] font-mono font-bold border ${
+                  isConnected
+                    ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                    : 'bg-amber-50 text-amber-700 border-amber-200'
+                }`}
+              >
+                <span
+                  className={`w-1.5 h-1.5 rounded-full ${
+                    isConnected ? 'bg-emerald-500 animate-pulse' : 'bg-amber-500'
+                  }`}
+                />
+                <span>WSS {dataHealth.latencyMs}ms</span>
+              </div>
             </div>
             <div className="text-[10px] text-purple-700 font-semibold tracking-wider uppercase">
               Kripto Mıntıkası

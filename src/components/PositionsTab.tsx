@@ -146,34 +146,61 @@ export const PositionsTab: React.FC<PositionsTabProps> = ({
               </div>
 
               {/* Price Metrics Grid */}
-              <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 bg-slate-50/80 p-2.5 rounded-2xl border border-slate-100 text-xs mb-3">
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 bg-slate-50/80 p-2.5 rounded-2xl border border-slate-100 text-xs mb-2.5">
                 <div>
-                  <span className="text-[10px] text-slate-400 block font-medium">Giriş Fiyatı</span>
+                  <span className="text-[10px] text-slate-400 block font-medium">Giriş / Güncel</span>
                   <span className="font-mono font-semibold text-slate-800 tabular-nums">
-                    ${pos.entryPrice.toFixed(pos.entryPrice < 1 ? 6 : 2)}
+                    ${pos.entryPrice.toFixed(pos.entryPrice < 1 ? 4 : 2)} → ${pos.currentPrice.toFixed(pos.currentPrice < 1 ? 4 : 2)}
                   </span>
                 </div>
 
                 <div>
-                  <span className="text-[10px] text-slate-400 block font-medium">Güncel Fiyat</span>
-                  <span className="font-mono font-semibold text-slate-900 tabular-nums">
-                    ${pos.currentPrice.toFixed(pos.currentPrice < 1 ? 6 : 2)}
+                  <span className="text-[10px] text-slate-400 block font-medium">Hedef (TP 2.2R)</span>
+                  <span className="font-mono font-semibold text-emerald-600 tabular-nums">
+                    ${pos.takeProfitPrice.toFixed(pos.takeProfitPrice < 1 ? 4 : 2)}
                   </span>
                 </div>
 
                 <div>
-                  <span className="text-[10px] text-rose-500 block font-medium">Likidasyon</span>
+                  <span className="text-[10px] text-slate-400 block font-medium flex items-center justify-between">
+                    <span>Stop Loss</span>
+                    {pos.isTrailingActive ? (
+                      <span className="text-[9px] text-indigo-600 font-bold">📈 Trailing</span>
+                    ) : pos.isBreakevenSet ? (
+                      <span className="text-[9px] text-blue-600 font-bold">🛡️ Başa Baş</span>
+                    ) : null}
+                  </span>
                   <span className="font-mono font-semibold text-rose-600 tabular-nums">
-                    ${pos.liquidationPrice.toFixed(pos.liquidationPrice < 1 ? 6 : 2)}
+                    ${pos.stopLossPrice.toFixed(pos.stopLossPrice < 1 ? 4 : 2)}
                   </span>
                 </div>
 
                 <div>
-                  <span className="text-[10px] text-purple-600 block font-medium">İzole Marjin</span>
+                  <span className="text-[10px] text-purple-600 block font-medium">İzole Marjin / Risk</span>
                   <span className="font-mono font-semibold text-purple-900 tabular-nums">
-                    ${pos.margin.toFixed(1)} USDT
+                    ${pos.margin.toFixed(0)} (${pos.initialRiskAmount.toFixed(1)}R)
                   </span>
                 </div>
+              </div>
+
+              {/* Status Tags & Strategy Reason */}
+              <div className="flex flex-wrap items-center gap-1.5 mb-2 text-[10px]">
+                <span className="px-2 py-0.5 rounded-md bg-purple-100 text-purple-800 font-bold font-mono">
+                  {pos.confidenceScore}p Teyit
+                </span>
+                <span className="px-2 py-0.5 rounded-md bg-slate-100 text-slate-700 font-medium font-mono">
+                  Rejim: {pos.marketRegime}
+                </span>
+                {pos.isBreakevenSet && (
+                  <span className="px-2 py-0.5 rounded-md bg-blue-100 text-blue-800 font-bold">
+                    🛡️ Başa Baş Kilitli
+                  </span>
+                )}
+                {pos.isTrailingActive && (
+                  <span className="px-2 py-0.5 rounded-md bg-indigo-100 text-indigo-800 font-bold">
+                    📈 ATR Takip Eden Stop
+                  </span>
+                )}
               </div>
 
               {/* Strategy Reason */}

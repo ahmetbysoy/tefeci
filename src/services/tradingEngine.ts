@@ -1,5 +1,6 @@
 import {
   DecisionLog,
+  ExitReason,
   IndicatorSnapshot,
   Loan,
   MarketTicker,
@@ -12,6 +13,7 @@ import {
 import { binanceFeed } from './binanceFeed';
 import { CHARACTER_DATA, CIRAK_DIALOGUES, TRADER_DIALOGUES } from './dialogues';
 import { soundService } from './soundAndTts';
+import { StrategyBrain } from './strategyBrain';
 
 export const INITIAL_TRADERS: Record<TraderId, TraderProfile> = {
   selo: {
@@ -35,6 +37,12 @@ export const INITIAL_TRADERS: Record<TraderId, TraderProfile> = {
     fearLevel: 5,
     isAggressive: true,
     statusText: 'Kapıda borç sırasında 1. sırada bekliyor...',
+    riskMode: 'NORMAL',
+    consecutiveLosses: 0,
+    lastLossTimestamp: 0,
+    symbolCooldowns: {},
+    creditRating: 'A',
+    expectedCollectionRate: 88,
     voicePitch: CHARACTER_DATA.selo.voicePitch,
     voiceRate: CHARACTER_DATA.selo.voiceRate,
   },
@@ -59,6 +67,12 @@ export const INITIAL_TRADERS: Record<TraderId, TraderProfile> = {
     fearLevel: 20,
     isAggressive: false,
     statusText: 'Kapıda borç sırasında 2. sırada bekliyor...',
+    riskMode: 'NORMAL',
+    consecutiveLosses: 0,
+    lastLossTimestamp: 0,
+    symbolCooldowns: {},
+    creditRating: 'AA',
+    expectedCollectionRate: 94,
     voicePitch: CHARACTER_DATA.mehmet.voicePitch,
     voiceRate: CHARACTER_DATA.mehmet.voiceRate,
   },
@@ -83,6 +97,12 @@ export const INITIAL_TRADERS: Record<TraderId, TraderProfile> = {
     fearLevel: 10,
     isAggressive: false,
     statusText: 'Kapıda borç sırasında 3. sırada bekliyor...',
+    riskMode: 'NORMAL',
+    consecutiveLosses: 0,
+    lastLossTimestamp: 0,
+    symbolCooldowns: {},
+    creditRating: 'AA',
+    expectedCollectionRate: 94,
     voicePitch: CHARACTER_DATA.kemal.voicePitch,
     voiceRate: CHARACTER_DATA.kemal.voiceRate,
   },
@@ -107,6 +127,12 @@ export const INITIAL_TRADERS: Record<TraderId, TraderProfile> = {
     fearLevel: 15,
     isAggressive: false,
     statusText: 'Kapıda borç sırasında 4. sırada bekliyor...',
+    riskMode: 'NORMAL',
+    consecutiveLosses: 0,
+    lastLossTimestamp: 0,
+    symbolCooldowns: {},
+    creditRating: 'AAA',
+    expectedCollectionRate: 98,
     voicePitch: CHARACTER_DATA.nuri.voicePitch,
     voiceRate: CHARACTER_DATA.nuri.voiceRate,
   },
@@ -131,6 +157,12 @@ export const INITIAL_TRADERS: Record<TraderId, TraderProfile> = {
     fearLevel: 10,
     isAggressive: false,
     statusText: 'Kapıda borç sırasında 5. sırada bekliyor...',
+    riskMode: 'NORMAL',
+    consecutiveLosses: 0,
+    lastLossTimestamp: 0,
+    symbolCooldowns: {},
+    creditRating: 'AAA',
+    expectedCollectionRate: 98,
     voicePitch: CHARACTER_DATA.sevil.voicePitch,
     voiceRate: CHARACTER_DATA.sevil.voiceRate,
   },
@@ -159,9 +191,38 @@ class TradingEngine {
   }
 
   private init() {
+    // Restore past decision logs from localStorage for the "Sicil" ledger
+    if (typeof window !== 'undefined') {
+      try {
+        const savedLogs = localStorage.getItem('tefeci_decision_logs');
+        if (savedLogs) {
+          this.decisionLogs = JSON.parse(savedLogs);
+        }
+      } catch {
+        // ignore
+      }
+    }
+
     // Listen to Binance live ticker
     binanceFeed.onMarketUpdate((ticker) => {
       this.updatePositionsWithPrice(ticker);
+    });
+
+    // Listen to Binance real whale liquidations (forceOrder stream)
+    binanceFeed.onLiquidation((liq) => {
+      const notional = liq.price * liq.qty;
+      if (notional > 40000) {
+        this.addNewsEvent({
+          type: 'LIQUIDATION',
+          speaker: 'cirak',
+          speakerName: 'Cilet Ferhat',
+          message: `Binance Balina Avı! ${liq.symbol} tahtasında az önce ${liq.qty.toFixed(0)} adet ($${notional.toFixed(0)}) ${
+            liq.side === 'SELL' ? 'LONG' : 'SHORT'
+          } likidasyon fitili patlatıldı!`,
+          badge: `💥 BİNANCE LİKİT ($${(notional / 1000).toFixed(0)}k)`,
+        });
+        this.notify();
+      }
     });
 
     // Main evaluation loop every 1.5 seconds
@@ -205,7 +266,6 @@ class TradingEngine {
     ];
 
     queueOrder.forEach((item, index) => {
-      const trader = this.traders[item.id];
       const initialInterestRate = 20; // 20%
       const loan: Loan = {
         id: `loan_init_${item.id}`,
@@ -235,7 +295,7 @@ class TradingEngine {
     this.openPositions = [];
     this.loans = [];
     this.newsFeed = [];
-    this.decisionLogs = [];
+    // Note: keep decisionLogs in history for the Sicil ledger, or user can clear if wanted
 
     this.initializeLoanQueue();
 
@@ -250,14 +310,16 @@ class TradingEngine {
     this.notify();
   }
 
-  // Position updates and live PnL / liquidation checks
+  // Dynamic Position Management: Breakeven, ATR Trailing, Time Stop, Liquidation, TP
   private updatePositionsWithPrice(ticker: MarketTicker) {
     let stateChanged = false;
+    const now = Date.now();
 
     for (let i = this.openPositions.length - 1; i >= 0; i--) {
       const pos = this.openPositions[i];
       if (pos.symbol !== ticker.symbol) continue;
 
+      const trader = this.traders[pos.traderId];
       pos.currentPrice = ticker.lastPrice;
       pos.markPrice = ticker.markPrice || ticker.lastPrice;
 
@@ -274,7 +336,62 @@ class TradingEngine {
 
       pos.roePercent = (pos.unrealizedPnl / pos.margin) * 100;
 
-      // Check LIQUIDATION condition
+      // Track Max Favorable / Adverse Excursion
+      if (pos.unrealizedPnl > pos.maxFavorableExcursion) {
+        pos.maxFavorableExcursion = pos.unrealizedPnl;
+      }
+      if (pos.unrealizedPnl < pos.maxAdverseExcursion) {
+        pos.maxAdverseExcursion = pos.unrealizedPnl;
+      }
+
+      // Calculate R multiple progress
+      const currentR =
+        pos.initialRiskAmount > 0 ? pos.unrealizedPnl / pos.initialRiskAmount : 0;
+
+      // 1. BREAKEVEN STOP TRIGGER (+1.0R): move stop to entry price + fee cushion
+      if (currentR >= 1.0 && !pos.isBreakevenSet) {
+        pos.isBreakevenSet = true;
+        const feeCushion = pos.entryPrice * 0.0008;
+        pos.stopLossPrice =
+          pos.side === 'LONG'
+            ? Number((pos.entryPrice + feeCushion).toFixed(pos.entryPrice < 1 ? 6 : 2))
+            : Number((pos.entryPrice - feeCushion).toFixed(pos.entryPrice < 1 ? 6 : 2));
+
+        this.addNewsEvent({
+          type: 'RISK_ALERT',
+          speaker: 'cirak',
+          speakerName: 'Cilet Ferhat',
+          message: `${trader.name} ${pos.symbol} işleminde +1R kâr gördü! Stopu başa başa çekti, risksiz modda!`,
+          badge: '🛡️ BAŞA BAŞ STOP',
+        });
+      }
+
+      // 2. ATR TRAILING STOP TRIGGER (+1.6R)
+      if (currentR >= 1.6) {
+        pos.isTrailingActive = true;
+        const trailingDist = Math.max(pos.entryIndicators.atr * 1.0, pos.entryPrice * 0.005);
+        if (pos.side === 'LONG') {
+          const candidateStop = pos.currentPrice - trailingDist;
+          if (candidateStop > pos.stopLossPrice) {
+            pos.stopLossPrice = Number(candidateStop.toFixed(pos.entryPrice < 1 ? 6 : 2));
+          }
+        } else {
+          const candidateStop = pos.currentPrice + trailingDist;
+          if (candidateStop < pos.stopLossPrice) {
+            pos.stopLossPrice = Number(candidateStop.toFixed(pos.entryPrice < 1 ? 6 : 2));
+          }
+        }
+      }
+
+      // 3. TIME STOP: Scalp lasting > 8 minutes without positive progress
+      const holdingDuration = (now - pos.openTime) / 1000;
+      if (holdingDuration >= 480 && pos.unrealizedPnl <= 0) {
+        this.closePosition(pos, ticker.lastPrice, 'TIME_STOP');
+        stateChanged = true;
+        continue;
+      }
+
+      // 4. CHECK LIQUIDATION
       const isLiquidated =
         (pos.side === 'LONG' && pos.markPrice <= pos.liquidationPrice) ||
         (pos.side === 'SHORT' && pos.markPrice >= pos.liquidationPrice);
@@ -285,7 +402,7 @@ class TradingEngine {
         continue;
       }
 
-      // Check Take Profit
+      // 5. CHECK TAKE PROFIT
       const hitTp =
         (pos.side === 'LONG' && pos.currentPrice >= pos.takeProfitPrice) ||
         (pos.side === 'SHORT' && pos.currentPrice <= pos.takeProfitPrice);
@@ -296,13 +413,17 @@ class TradingEngine {
         continue;
       }
 
-      // Check Stop Loss
+      // 6. CHECK STOP LOSS (Breakeven, Trailing, or Initial Stop)
       const hitSl =
         (pos.side === 'LONG' && pos.currentPrice <= pos.stopLossPrice) ||
         (pos.side === 'SHORT' && pos.currentPrice >= pos.stopLossPrice);
 
       if (hitSl) {
-        this.closePosition(pos, pos.stopLossPrice, 'STOP_LOSS');
+        let exitReason: ExitReason = 'STOP_LOSS';
+        if (pos.isTrailingActive) exitReason = 'TRAILING_STOP';
+        else if (pos.isBreakevenSet) exitReason = 'BREAKEVEN';
+
+        this.closePosition(pos, pos.stopLossPrice, exitReason);
         stateChanged = true;
         continue;
       }
@@ -320,7 +441,7 @@ class TradingEngine {
     // 1. Update active loans countdown and interest
     this.updateLoans();
 
-    // 2. Evaluate strategy entries for each trader (ONLY if they received a loan and have balance)
+    // 2. Evaluate strategy entries using StrategyBrain
     const symbols = binanceFeed.getSymbols();
     for (const traderId of Object.keys(this.traders) as TraderId[]) {
       const trader = this.traders[traderId];
@@ -350,7 +471,7 @@ class TradingEngine {
     this.notify();
   }
 
-  // Strategy Execution Engine
+  // Strategy Execution Engine powered by StrategyBrain
   private evaluateTraderStrategy(
     trader: TraderProfile,
     symbol: string,
@@ -363,167 +484,84 @@ class TradingEngine {
     );
     if (existing) return;
 
-    let side: OrderSide | null = null;
-    let leverage = 10;
-    let reason = '';
-    let tpPct = 0.02;
-    let slPct = 0.01;
-
-    switch (trader.id) {
-      case 'mehmet': // Fitilci: Stop & Wick hunter
-        if (ind.spikeShadowRatio > 2.0 && ind.rsi14 < 35) {
-          side = 'LONG';
-          leverage = 20;
-          tpPct = 0.025;
-          slPct = 0.012;
-          reason = `Alt fitil oranı ${ind.spikeShadowRatio.toFixed(1)}x, RSI ${ind.rsi14}. Stop avı bitti, yukarı tepki alımı!`;
-        } else if (ind.spikeShadowRatio > 2.0 && ind.rsi14 > 65) {
-          side = 'SHORT';
-          leverage = 20;
-          tpPct = 0.025;
-          slPct = 0.012;
-          reason = `Üst fitil oranı ${ind.spikeShadowRatio.toFixed(1)}x, RSI ${ind.rsi14}. Tepeden likidasyon iğnesi, shortluyoruz!`;
-        }
-        break;
-
-      case 'kemal': // Tahta Kemal: Orderbook imbalance
-        if (ind.orderbookImbalance > 0.65) {
-          side = 'LONG';
-          leverage = 15;
-          tpPct = 0.018;
-          slPct = 0.01;
-          reason = `Alış kademelerinde devasa balina duvarı (%${(ind.orderbookImbalance * 100).toFixed(0)} bid derinliği). Yukarı sürecekler.`;
-        } else if (ind.orderbookImbalance < 0.35) {
-          side = 'SHORT';
-          leverage = 15;
-          tpPct = 0.018;
-          slPct = 0.01;
-          reason = `Satış kademelerine blok dizdiler (%${((1 - ind.orderbookImbalance) * 100).toFixed(0)} ask derinliği). Duvar arkasından short.`;
-        }
-        break;
-
-      case 'nuri': // Fonlama Nuri: Funding Contrarian
-        if (ind.fundingRate < -0.0001) {
-          side = 'LONG';
-          leverage = 15;
-          tpPct = 0.03;
-          slPct = 0.015;
-          reason = `Aşırı negatif fonlama (%${(ind.fundingRate * 100).toFixed(4)}). Shortcular ceza ödüyor, short squeeze patlatacağız!`;
-        } else if (ind.fundingRate > 0.0002) {
-          side = 'SHORT';
-          leverage = 15;
-          tpPct = 0.03;
-          slPct = 0.015;
-          reason = `Aşırı pozitif fonlama (%${(ind.fundingRate * 100).toFixed(4)}). Long kalabalığı şişti, balina biçme vakti!`;
-        }
-        break;
-
-      case 'selo': // Selo Roket: Volume surge momentum scalper
-        if (ind.volumeSurgeRatio > 1.8 && ticker.lastPrice > ind.ema20) {
-          side = 'LONG';
-          leverage = 35;
-          tpPct = 0.04;
-          slPct = 0.02;
-          reason = `Hacim ortalamanın ${ind.volumeSurgeRatio.toFixed(1)} katı! Fiyat EMA20'yi yardı geçiyor, roket kalkıyor!`;
-        } else if (ind.volumeSurgeRatio > 1.8 && ticker.lastPrice < ind.ema20) {
-          side = 'SHORT';
-          leverage = 35;
-          tpPct = 0.04;
-          slPct = 0.02;
-          reason = `Satış hacmi patladı (${ind.volumeSurgeRatio.toFixed(1)}x)! Aşağı çakılıyor, 35x şort!`;
-        }
-        break;
-
-      case 'sevil': // Madam Sevil: Bollinger Mean Reversion
-        if (ticker.lastPrice <= ind.bbLower && ind.rsi14 < 40) {
-          side = 'LONG';
-          leverage = 12;
-          tpPct = 0.02;
-          slPct = 0.012;
-          reason = `Fiyat Bollinger alt bandını deldi, RSI ${ind.rsi14}. Merkeze dönüş kaçınılmaz.`;
-        } else if (ticker.lastPrice >= ind.bbUpper && ind.rsi14 > 60) {
-          side = 'SHORT';
-          leverage = 12;
-          tpPct = 0.02;
-          slPct = 0.012;
-          reason = `Fiyat Bollinger üst bandına çarptı, RSI ${ind.rsi14}. Zarifçe şortluyoruz.`;
-        }
-        break;
+    // Evaluate trade candidate using StrategyBrain
+    const evalResult = StrategyBrain.evaluate(trader, symbol, ticker, ind);
+    if (!evalResult.shouldEnter || !evalResult.side) {
+      return;
     }
 
-    if (side && reason) {
-      // Risk size: allocate 25% - 40% of balance to this position margin
-      const margin = Math.min(trader.balance * 0.35, 1200);
-      if (margin < 50) return;
-
-      const notional = margin * leverage;
-      const size = notional / ticker.lastPrice;
-      const entryPrice = ticker.lastPrice;
-
-      // Calculate liquidation price
-      const liqPrice =
-        side === 'LONG'
-          ? entryPrice * (1 - (1 / leverage) * 0.94)
-          : entryPrice * (1 + (1 / leverage) * 0.94);
-
-      const tpPrice =
-        side === 'LONG' ? entryPrice * (1 + tpPct) : entryPrice * (1 - tpPct);
-      const slPrice =
-        side === 'LONG' ? entryPrice * (1 - slPct) : entryPrice * (1 + slPct);
-
-      // Deduct margin from trader balance
-      trader.balance -= margin;
-
-      const newPos: Position = {
-        id: `pos_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
-        traderId: trader.id,
-        symbol,
-        side,
-        entryPrice,
-        currentPrice: entryPrice,
-        markPrice: ticker.markPrice || entryPrice,
-        size,
-        notional,
-        margin,
-        leverage,
-        liquidationPrice: liqPrice,
-        takeProfitPrice: tpPrice,
-        stopLossPrice: slPrice,
-        unrealizedPnl: 0,
-        roePercent: 0,
-        openTime: Date.now(),
-        status: 'OPEN',
-        strategyReason: reason,
-        entryIndicators: { ...ind },
-        liquidationDistancePercent:
-          side === 'LONG'
-            ? ((entryPrice - liqPrice) / entryPrice) * 100
-            : ((liqPrice - entryPrice) / entryPrice) * 100,
-      };
-
-      this.openPositions.unshift(newPos);
-      trader.statusText = `${symbol} ${side} ${leverage}x açtı`;
-
-      // Speech & News
-      const entryQuotes = TRADER_DIALOGUES[trader.id].tradeEntry;
-      const quote = entryQuotes[Math.floor(Math.random() * entryQuotes.length)];
-      soundService.speak(quote, trader.id);
-
-      this.addNewsEvent({
-        type: 'WHALE_ALERT',
-        speaker: trader.id,
-        speakerName: trader.name,
-        message: `${symbol} tahtasında ${leverage}x ${side} pozisyon açtı! "${quote}"`,
-        badge: `${symbol} ${leverage}x ${side}`,
-      });
+    // Ensure trader has enough balance
+    if (trader.balance < evalResult.margin) {
+      return;
     }
+
+    // Deduct margin from trader balance
+    trader.balance -= evalResult.margin;
+
+    // Calculate isolated liquidation price
+    const liqPrice =
+      evalResult.side === 'LONG'
+        ? evalResult.entryPrice * (1 - (1 / evalResult.recommendedLeverage) * 0.94)
+        : evalResult.entryPrice * (1 + (1 / evalResult.recommendedLeverage) * 0.94);
+
+    const newPos: Position = {
+      id: `pos_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+      traderId: trader.id,
+      symbol,
+      side: evalResult.side,
+      entryPrice: evalResult.entryPrice,
+      currentPrice: evalResult.entryPrice,
+      markPrice: ticker.markPrice || evalResult.entryPrice,
+      size: evalResult.unitSize,
+      notional: evalResult.notionalSize,
+      margin: evalResult.margin,
+      leverage: evalResult.recommendedLeverage,
+      liquidationPrice: liqPrice,
+      takeProfitPrice: evalResult.takeProfitPrice,
+      stopLossPrice: evalResult.stopLossPrice,
+      initialStopLossPrice: evalResult.stopLossPrice,
+      initialRiskAmount: evalResult.riskAmount,
+      rDistance: evalResult.initialStopDistance,
+      unrealizedPnl: 0,
+      roePercent: 0,
+      openTime: Date.now(),
+      status: 'OPEN',
+      strategyReason: evalResult.reason,
+      entryIndicators: { ...ind },
+      confidenceScore: evalResult.confidenceScore,
+      marketRegime: evalResult.marketRegime,
+      isBreakevenSet: false,
+      isTrailingActive: false,
+      maxFavorableExcursion: 0,
+      maxAdverseExcursion: 0,
+      liquidationDistancePercent:
+        evalResult.side === 'LONG'
+          ? ((evalResult.entryPrice - liqPrice) / evalResult.entryPrice) * 100
+          : ((liqPrice - evalResult.entryPrice) / evalResult.entryPrice) * 100,
+    };
+
+    this.openPositions.unshift(newPos);
+    trader.statusText = `${symbol} ${evalResult.side} ${evalResult.recommendedLeverage}x açtı (Puan: ${evalResult.confidenceScore})`;
+
+    // Speech & News
+    const entryQuotes = TRADER_DIALOGUES[trader.id].tradeEntry;
+    const quote = entryQuotes[Math.floor(Math.random() * entryQuotes.length)];
+    soundService.speak(quote, trader.id);
+
+    this.addNewsEvent({
+      type: 'WHALE_ALERT',
+      speaker: trader.id,
+      speakerName: trader.name,
+      message: `${symbol} tahtasında ${evalResult.recommendedLeverage}x ${evalResult.side} pozisyon açtı! (Teyit: ${evalResult.confidenceScore}/100, Rejim: ${evalResult.marketRegime}). "${quote}"`,
+      badge: `${symbol} ${evalResult.recommendedLeverage}x [${evalResult.confidenceScore}p]`,
+    });
   }
 
-  // Close position (TP or SL)
+  // Close position (TP, SL, Breakeven, Trailing, TimeStop)
   private closePosition(
     pos: Position,
     exitPrice: number,
-    exitReason: 'TAKE_PROFIT' | 'STOP_LOSS'
+    exitReason: ExitReason
   ) {
     const trader = this.traders[pos.traderId];
     const pnl =
@@ -531,15 +569,21 @@ class TradingEngine {
         ? (exitPrice - pos.entryPrice) * pos.size
         : (pos.entryPrice - exitPrice) * pos.size;
 
-    // Deduct standard VIP 0 futures fee
+    // Deduct VIP 0 taker futures fee (0.05% * 2)
     const fee = pos.notional * 0.0005 * 2;
     const finalPnl = pnl - fee;
 
     trader.balance += pos.margin + finalPnl;
     trader.totalPnl += finalPnl;
 
-    if (finalPnl >= 0) {
+    const isWin = finalPnl >= 0;
+
+    if (isWin) {
       trader.winCount++;
+      // Reset consecutive losses and restore Normal mode
+      trader.consecutiveLosses = 0;
+      trader.riskMode = 'NORMAL';
+
       soundService.playCashSound();
       const winQuotes = TRADER_DIALOGUES[trader.id].bigWinShout;
       const winSpeech = winQuotes[Math.floor(Math.random() * winQuotes.length)];
@@ -549,25 +593,46 @@ class TradingEngine {
         type: 'MASSIVE_PROFIT',
         speaker: trader.id,
         speakerName: trader.name,
-        message: `${pos.symbol} pozisyonunu +${finalPnl.toFixed(1)} USDT (%${pos.roePercent.toFixed(1)}) kârla kapattı! "${winSpeech}"`,
-        badge: `+${finalPnl.toFixed(0)} USDT KÂR`,
+        message: `${pos.symbol} pozisyonunu +${finalPnl.toFixed(1)} USDT (%${pos.roePercent.toFixed(1)}) kârla kapattı [${exitReason}]! "${winSpeech}"`,
+        badge: `+${finalPnl.toFixed(0)} USDT [${exitReason}]`,
       });
 
-      // Auto repay loan if has active debt and surplus balance
       this.checkAutoLoanRepayment(trader);
     } else {
       trader.lossCount++;
-      this.addNewsEvent({
-        type: 'LIQUIDATION',
-        speaker: trader.id,
-        speakerName: trader.name,
-        message: `${pos.symbol} stop oldu! Zarar: ${finalPnl.toFixed(1)} USDT.`,
-        badge: `${finalPnl.toFixed(0)} USDT ZARAR`,
-      });
+      // Adaptive Risk Memory
+      trader.consecutiveLosses++;
+      trader.lastLossTimestamp = Date.now();
+      trader.symbolCooldowns[pos.symbol] = Date.now() + 60000; // 60s revenge trade lock!
+      trader.riskMode = StrategyBrain.evaluateRiskMode(trader);
+
+      if (trader.consecutiveLosses >= 2) {
+        this.addNewsEvent({
+          type: 'RISK_ALERT',
+          speaker: 'cirak',
+          speakerName: 'Cilet Ferhat',
+          message: `Usta! ${trader.name} peş peşe ${trader.consecutiveLosses}. kez stop oldu! Risk modu BUZDA olarak kilitlendi, kaldıraç düşürüldü!`,
+          badge: '❄️ RİSK KİLİDİ: BUZDA',
+          urgent: true,
+        });
+      } else {
+        this.addNewsEvent({
+          type: 'LIQUIDATION',
+          speaker: trader.id,
+          speakerName: trader.name,
+          message: `${pos.symbol} stop oldu! Zarar: ${finalPnl.toFixed(1)} USDT [${exitReason}].`,
+          badge: `${finalPnl.toFixed(0)} USDT [${exitReason}]`,
+        });
+      }
     }
 
-    // Record Decision Log for AI Analysis
-    this.recordDecisionLog(pos, exitPrice, finalPnl, exitReason);
+    // Dynamically update Trader Credit Rating and Collection Rate
+    const credit = StrategyBrain.evaluateCreditRating(trader);
+    trader.creditRating = credit.rating;
+    trader.expectedCollectionRate = credit.collectionRate;
+
+    // Record Decision Log for the "Sicil" ledger
+    this.recordDecisionLog(pos, exitPrice, finalPnl, exitReason, fee);
 
     // Remove from open positions
     this.openPositions = this.openPositions.filter((p) => p.id !== pos.id);
@@ -577,7 +642,15 @@ class TradingEngine {
   private liquidatePosition(pos: Position, markPrice: number) {
     const trader = this.traders[pos.traderId];
     trader.lossCount++;
+    trader.consecutiveLosses++;
+    trader.lastLossTimestamp = Date.now();
+    trader.symbolCooldowns[pos.symbol] = Date.now() + 60000;
+    trader.riskMode = StrategyBrain.evaluateRiskMode(trader);
     trader.totalPnl -= pos.margin;
+
+    const credit = StrategyBrain.evaluateCreditRating(trader);
+    trader.creditRating = credit.rating;
+    trader.expectedCollectionRate = credit.collectionRate;
 
     soundService.playLiquidationSound();
     const liqQuotes = TRADER_DIALOGUES[trader.id].liquidationShout;
@@ -599,8 +672,8 @@ class TradingEngine {
       urgent: true,
     });
 
-    // Record detailed failure analysis for AI export
-    this.recordDecisionLog(pos, markPrice, -pos.margin, 'LIQUIDATED');
+    // Record detailed failure analysis
+    this.recordDecisionLog(pos, markPrice, -pos.margin, 'LIQUIDATED', pos.notional * 0.001);
 
     this.openPositions = this.openPositions.filter((p) => p.id !== pos.id);
 
@@ -610,30 +683,33 @@ class TradingEngine {
     }
   }
 
-  // Record trade into Decision Logs (Downloadable JSON / MD for AI inspection)
+  // Record trade into Decision Logs (saved to localStorage for Sicil)
   private recordDecisionLog(
     pos: Position,
     exitPrice: number,
     realizedPnl: number,
-    exitReason: 'TAKE_PROFIT' | 'STOP_LOSS' | 'LIQUIDATED' | 'MARGIN_CUT'
+    exitReason: ExitReason,
+    feePaid: number
   ) {
     const trader = this.traders[pos.traderId];
     const ind = pos.entryIndicators;
+    const holdingDuration = Math.round((Date.now() - pos.openTime) / 1000);
+    const rMultiple = pos.initialRiskAmount > 0 ? realizedPnl / pos.initialRiskAmount : 0;
 
     let whyFailed = '';
     let improvementNote = '';
 
     if (realizedPnl < 0) {
       if (exitReason === 'LIQUIDATED') {
-        whyFailed = `Aşırı yüksek kaldıraç (${pos.leverage}x) ve oynaklık nedeniyle mark price ${pos.liquidationPrice.toFixed(2)} seviyesine değerek izole marjin sıfırlandı. Giriş anındaki RSI: ${ind.rsi14}, Hacim Oranı: ${ind.volumeSurgeRatio.toFixed(1)}x, Fonlama: ${ind.fundingRate}.`;
-        improvementNote = `Kaldıraç ${Math.max(5, Math.floor(pos.leverage * 0.6))}x seviyesine çekilmeli, likidasyon tamponu genişletilmeli ve ATR bazlı dinamik stop-loss konulmalıdır.`;
+        whyFailed = `Aşırı yüksek kaldıraç (${pos.leverage}x) ve ani iğne nedeniyle mark price ${pos.liquidationPrice.toFixed(2)} seviyesini deldi. Giriş RSI: ${ind.rsi14}, Teyit Puanı: ${pos.confidenceScore}.`;
+        improvementNote = `Kaldıraç ${Math.max(5, Math.floor(pos.leverage * 0.6))}x seviyesine çekilmeli, ATR tamponu genişletilmelidir.`;
       } else {
-        whyFailed = `Piyasa dalgalanması stop seviyesini (${pos.stopLossPrice.toFixed(2)}) tetikledi. Giriş yönü: ${pos.side}, Çıkış fiyatı: ${exitPrice.toFixed(2)}.`;
-        improvementNote = `Fitil gürültüsüne karşı stop mesafesi 1.5x ATR genişletilmeli ve emir defteri derinliği teyit edilmeden işleme girilmemelidir.`;
+        whyFailed = `Piyasa dalgalanması stop seviyesini (${pos.stopLossPrice.toFixed(2)}) tetikledi. Rejim: ${pos.marketRegime}.`;
+        improvementNote = `Fitil gürültüsüne karşı stop mesafesi 1.5x ATR genişletilmeli ve karşıt yönlü hacim barları filtrelenmelidir.`;
       }
     } else {
-      whyFailed = `Pozisyon başarıyla hedefe ulaştı. Kâr: ${realizedPnl.toFixed(2)} USDT.`;
-      improvementNote = `Strateji beklendiği gibi çalıştı. Trailing stop mekanizması ile ek getiri optimize edilebilir.`;
+      whyFailed = `Pozisyon hedefe ulaştı. Kapanış nedeni: ${exitReason}.`;
+      improvementNote = `Strateji beklendiği gibi çalıştı (+${rMultiple.toFixed(2)}R getiri).`;
     }
 
     const log: DecisionLog = {
@@ -655,9 +731,26 @@ class TradingEngine {
       whyOpened: pos.strategyReason,
       whyFailedOrWon: whyFailed,
       aiImprovementNote: improvementNote,
+      confidenceScore: pos.confidenceScore || 70,
+      marketRegime: pos.marketRegime || 'RANGE',
+      holdingDurationSeconds: holdingDuration,
+      feePaid,
+      rMultiple,
     };
 
     this.decisionLogs.unshift(log);
+
+    // Persist to localStorage
+    if (typeof window !== 'undefined') {
+      try {
+        localStorage.setItem(
+          'tefeci_decision_logs',
+          JSON.stringify(this.decisionLogs.slice(0, 150))
+        );
+      } catch {
+        // ignore
+      }
+    }
   }
 
   // Loan Mechanics
@@ -839,7 +932,7 @@ class TradingEngine {
     if (trader.balance >= loan.totalDue) {
       this.settleLoan(loan, trader);
     } else {
-      // Partial payment with all available balance, then close some positions
+      // Partial payment with all available balance
       const partialPayment = Math.max(0, trader.balance - 100);
       if (partialPayment > 0) {
         trader.balance -= partialPayment;

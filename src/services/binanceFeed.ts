@@ -1,4 +1,4 @@
-import { IndicatorSnapshot, MarketTicker } from '../types';
+import { DataHealthStatus, IndicatorSnapshot, MarketTicker } from '../types';
 
 export interface KlineData {
   openTime: number;
@@ -10,8 +10,24 @@ export interface KlineData {
   closeTime: number;
 }
 
+export interface AggTradeEvent {
+  time: number;
+  price: number;
+  qty: number;
+  isBuyerMaker: boolean; // if false, aggressive buyer hitting ask
+}
+
+export interface LiquidationOrderEvent {
+  symbol: string;
+  side: 'BUY' | 'SELL'; // if SELL -> a LONG was liquidated; if BUY -> a SHORT was liquidated
+  price: number;
+  qty: number;
+  timestamp: number;
+}
+
 export type MarketUpdateCallback = (ticker: MarketTicker) => void;
 export type IndicatorsUpdateCallback = (symbol: string, indicators: IndicatorSnapshot) => void;
+export type LiquidationEventCallback = (event: LiquidationOrderEvent) => void;
 
 class BinanceFeedService {
   private ws: WebSocket | null = null;
@@ -20,13 +36,26 @@ class BinanceFeedService {
   private klinesHistory: Map<string, KlineData[]> = new Map();
   private indicatorsCache: Map<string, IndicatorSnapshot> = new Map();
 
+  // Advanced Data Layer: AggTrades (CVD), Open Interest, Liquidations
+  private aggTradesMap: Map<string, AggTradeEvent[]> = new Map();
+  private openInterestMap: Map<string, { current: number; history: { oi: number; time: number }[] }> = new Map();
+  private liquidationsMap: Map<string, LiquidationOrderEvent[]> = new Map();
+
   private marketCallbacks: Set<MarketUpdateCallback> = new Set();
   private indicatorCallbacks: Set<IndicatorsUpdateCallback> = new Set();
+  private liquidationCallbacks: Set<LiquidationEventCallback> = new Set();
 
   private reconnectAttempts: number = 0;
   private reconnectTimeout: number | null = null;
   private isDestroyed: boolean = false;
   private pollInterval: number | null = null;
+  private oiPollInterval: number | null = null;
+
+  // Data health metrics
+  private totalMessagesReceived: number = 0;
+  private lastMessageTime: number = Date.now();
+  private latencyMs: number = 28;
+  private connectionStatus: 'CONNECTED' | 'RECONNECTING' | 'FALLBACK_REST' = 'CONNECTED';
 
   constructor() {
     this.initFeed();
@@ -53,6 +82,11 @@ class BinanceFeedService {
     return () => this.indicatorCallbacks.delete(cb);
   }
 
+  public onLiquidation(cb: LiquidationEventCallback): () => void {
+    this.liquidationCallbacks.add(cb);
+    return () => this.liquidationCallbacks.delete(cb);
+  }
+
   public getTicker(symbol: string): MarketTicker | undefined {
     return this.marketTickers.get(symbol.toUpperCase());
   }
@@ -65,15 +99,32 @@ class BinanceFeedService {
     return Array.from(this.marketTickers.values());
   }
 
+  public getDataHealth(): DataHealthStatus {
+    const isStale = Date.now() - this.lastMessageTime > 8000;
+    return {
+      status: isStale ? 'FALLBACK_REST' : this.connectionStatus,
+      latencyMs: this.latencyMs,
+      lastMessageTime: this.lastMessageTime,
+      activeStreamsCount: this.symbols.length * 5 + 1, // ticker, bookTicker, markPrice, kline, aggTrade + forceOrder
+      totalMessagesReceived: this.totalMessagesReceived,
+    };
+  }
+
   private initFeed() {
     this.fetchInitialData();
     this.connectWs();
 
-    // High frequency REST backup poll every 4 seconds in case websocket drops or misses ticks
+    // High frequency REST backup poll every 4 seconds
     if (typeof window !== 'undefined') {
       this.pollInterval = window.setInterval(() => {
         this.pollMarketData();
+        this.measureLatency();
       }, 4000);
+
+      // Open interest polling every 8 seconds
+      this.oiPollInterval = window.setInterval(() => {
+        this.pollOpenInterest();
+      }, 8000);
     }
   }
 
@@ -108,6 +159,43 @@ class BinanceFeedService {
   private async fetchInitialData() {
     for (const symbol of this.symbols) {
       this.fetchKlinesAndDepth(symbol);
+    }
+    this.pollOpenInterest();
+  }
+
+  private async measureLatency() {
+    try {
+      const start = performance.now();
+      const res = await fetch('https://fapi.binance.com/fapi/v1/time');
+      if (res.ok) {
+        this.latencyMs = Math.round(performance.now() - start);
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  private async pollOpenInterest() {
+    for (const symbol of this.symbols) {
+      try {
+        const res = await fetch(`https://fapi.binance.com/fapi/v1/openInterest?symbol=${symbol}`);
+        if (!res.ok) continue;
+        const data = await res.json();
+        const oi = parseFloat(data.openInterest || '0');
+        if (oi > 0) {
+          const prev = this.openInterestMap.get(symbol) || { current: oi, history: [] };
+          const now = Date.now();
+          prev.history.push({ oi, time: now });
+          // keep 15 minutes of OI history
+          const cutoff = now - 15 * 60 * 1000;
+          prev.history = prev.history.filter((h) => h.time >= cutoff);
+          prev.current = oi;
+          this.openInterestMap.set(symbol, prev);
+          this.recomputeIndicators(symbol);
+        }
+      } catch {
+        // ignore
+      }
     }
   }
 
@@ -254,14 +342,15 @@ class BinanceFeedService {
     if (typeof window === 'undefined' || this.isDestroyed) return;
 
     try {
-      // Build combined stream query: e.g. btcusdt@ticker/ethusdt@ticker/btcusdt@markPrice@1s
-      const streamNames: string[] = [];
+      // Build combined stream query with !forceOrder@arr, aggTrade, ticker, bookTicker, markPrice, kline
+      const streamNames: string[] = ['!forceOrder@arr'];
       this.symbols.forEach((sym) => {
         const s = sym.toLowerCase();
         streamNames.push(`${s}@ticker`);
         streamNames.push(`${s}@bookTicker`);
         streamNames.push(`${s}@markPrice@1s`);
         streamNames.push(`${s}@kline_1m`);
+        streamNames.push(`${s}@aggTrade`);
       });
 
       const wsUrl = `wss://fstream.binance.com/stream?streams=${streamNames.join('/')}`;
@@ -269,9 +358,12 @@ class BinanceFeedService {
 
       this.ws.onopen = () => {
         this.reconnectAttempts = 0;
+        this.connectionStatus = 'CONNECTED';
       };
 
       this.ws.onmessage = (event) => {
+        this.totalMessagesReceived++;
+        this.lastMessageTime = Date.now();
         try {
           const payload = JSON.parse(event.data);
           this.handleWsMessage(payload);
@@ -282,15 +374,18 @@ class BinanceFeedService {
 
       this.ws.onerror = (err) => {
         console.warn('Binance WebSocket encountered error:', err);
+        this.connectionStatus = 'FALLBACK_REST';
       };
 
       this.ws.onclose = () => {
+        this.connectionStatus = 'RECONNECTING';
         if (!this.isDestroyed) {
           this.scheduleReconnect();
         }
       };
     } catch (e) {
       console.warn('WebSocket connection failed, will retry:', e);
+      this.connectionStatus = 'RECONNECTING';
       this.scheduleReconnect();
     }
   }
@@ -298,8 +393,72 @@ class BinanceFeedService {
   private handleWsMessage(payload: { stream: string; data: Record<string, unknown> }) {
     if (!payload || !payload.data) return;
     const { stream, data } = payload;
+
+    // 1. Live ForceOrder Liquidation Stream (!forceOrder@arr)
+    if (stream.includes('forceOrder')) {
+      const o = data.o as {
+        s: string; // symbol
+        S: 'BUY' | 'SELL'; // side
+        q: string; // qty
+        p: string; // price
+      };
+      if (o && o.s) {
+        const sym = o.s.toUpperCase();
+        const liqEvent: LiquidationOrderEvent = {
+          symbol: sym,
+          side: o.S,
+          price: parseFloat(o.p),
+          qty: parseFloat(o.q),
+          timestamp: Date.now(),
+        };
+
+        const list = this.liquidationsMap.get(sym) || [];
+        list.push(liqEvent);
+        // keep 5 minutes of liquidation orders
+        const cutoff = Date.now() - 5 * 60 * 1000;
+        this.liquidationsMap.set(
+          sym,
+          list.filter((l) => l.timestamp >= cutoff)
+        );
+
+        // Notify liquidation listeners
+        this.liquidationCallbacks.forEach((cb) => {
+          try {
+            cb(liqEvent);
+          } catch {
+            // ignore
+          }
+        });
+
+        this.recomputeIndicators(sym);
+      }
+      return;
+    }
+
     const streamType = stream.split('@')[1];
     const symbol = (data.s as string) || stream.split('@')[0].toUpperCase();
+
+    // 2. Real-time AggTrade for Cumulative Volume Delta (CVD)
+    if (streamType === 'aggTrade') {
+      const trade: AggTradeEvent = {
+        time: Number(data.T || Date.now()),
+        price: parseFloat(String(data.p || '0')),
+        qty: parseFloat(String(data.q || '0')),
+        isBuyerMaker: Boolean(data.m),
+      };
+
+      const trades = this.aggTradesMap.get(symbol) || [];
+      trades.push(trade);
+      // keep 5 minutes of trades
+      const cutoff = Date.now() - 5 * 60 * 1000;
+      this.aggTradesMap.set(
+        symbol,
+        trades.filter((t) => t.time >= cutoff)
+      );
+
+      this.recomputeIndicators(symbol);
+      return;
+    }
 
     const currentTicker = this.marketTickers.get(symbol) || {
       symbol,
@@ -399,7 +558,7 @@ class BinanceFeedService {
     });
   }
 
-  // Pure mathematical indicators (RSI 14, EMA 20 & 50, Bollinger Bands 20/2, Shadow Spike Ratio, Volume Surge)
+  // Pure mathematical indicators + Real Futures Data Layer (OI, CVD, Liquidations)
   private recomputeIndicators(symbol: string) {
     const ticker = this.marketTickers.get(symbol);
     const klines = this.klinesHistory.get(symbol) || [];
@@ -467,6 +626,77 @@ class BinanceFeedService {
       }
     }
 
+    // 6. ATR (Average True Range, 14-period)
+    let atr = ticker.lastPrice * 0.008;
+    if (klines.length >= 2) {
+      const trueRanges: number[] = [];
+      for (let i = 1; i < klines.length; i++) {
+        const high = klines[i].high;
+        const low = klines[i].low;
+        const prevClose = klines[i - 1].close;
+        const tr = Math.max(high - low, Math.abs(high - prevClose), Math.abs(low - prevClose));
+        trueRanges.push(tr);
+      }
+      const recentTr = trueRanges.slice(-14);
+      if (recentTr.length > 0) {
+        atr = recentTr.reduce((a, b) => a + b, 0) / recentTr.length;
+      }
+    }
+
+    const bbWidth = bbMiddle > 0 ? (bbUpper - bbLower) / bbMiddle : 0.02;
+    const midPrice = (ticker.bestAsk + ticker.bestBid) / 2 || ticker.lastPrice || 1;
+    const spreadPercent = midPrice > 0 ? ((ticker.bestAsk - ticker.bestBid) / midPrice) * 100 : 0.02;
+
+    // 7. Real Binance Open Interest & OI Delta (5m)
+    const oiData = this.openInterestMap.get(symbol);
+    const openInterest = oiData?.current || 0;
+    let oiDelta5m = 0;
+    if (oiData && oiData.history.length >= 2) {
+      const oldest5m = oiData.history[0];
+      oiDelta5m = openInterest - oldest5m.oi;
+    }
+
+    // 8. Cumulative Volume Delta (CVD) from AggTrade Stream
+    const aggTrades = this.aggTradesMap.get(symbol) || [];
+    let takerBuyNotional = 0;
+    let takerSellNotional = 0;
+    aggTrades.forEach((t) => {
+      const notional = t.price * t.qty;
+      if (!t.isBuyerMaker) {
+        // Buyer took liquidity (aggressive buy)
+        takerBuyNotional += notional;
+      } else {
+        // Seller took liquidity (aggressive sell)
+        takerSellNotional += notional;
+      }
+    });
+
+    const cvd5m = takerBuyNotional - takerSellNotional;
+    const totalTakerNotional = takerBuyNotional + takerSellNotional;
+    const cvdRatio = totalTakerNotional > 0 ? takerBuyNotional / totalTakerNotional : 0.5;
+
+    // 9. Real Binance Force Orders (Liquidations) in last 5m
+    const liqs = this.liquidationsMap.get(symbol) || [];
+    let liqLongNotional = 0; // Forced SELL orders (liquidated Longs)
+    let liqShortNotional = 0; // Forced BUY orders (liquidated Shorts)
+
+    liqs.forEach((l) => {
+      const notional = l.price * l.qty;
+      if (l.side === 'SELL') {
+        liqLongNotional += notional;
+      } else {
+        liqShortNotional += notional;
+      }
+    });
+
+    const liquidationVolume5m = liqLongNotional + liqShortNotional;
+    let liquidationBurstSide: 'LONG' | 'SHORT' | 'NONE' = 'NONE';
+    if (liqLongNotional > 50000 && liqLongNotional > liqShortNotional * 2) {
+      liquidationBurstSide = 'LONG'; // Long squeeze liquidation flush
+    } else if (liqShortNotional > 50000 && liqShortNotional > liqLongNotional * 2) {
+      liquidationBurstSide = 'SHORT'; // Short squeeze liquidation flush
+    }
+
     const snapshot: IndicatorSnapshot = {
       timestamp: Date.now(),
       symbol,
@@ -481,6 +711,16 @@ class BinanceFeedService {
       fundingRate: Number(ticker.fundingRate.toFixed(6)),
       spikeShadowRatio: Number(spikeShadowRatio.toFixed(2)),
       volumeSurgeRatio: Number(volumeSurgeRatio.toFixed(2)),
+      atr: Number(atr.toFixed(4)),
+      bbWidth: Number(bbWidth.toFixed(4)),
+      spreadPercent: Number(spreadPercent.toFixed(4)),
+      // Real Futures Layer
+      openInterest: Number(openInterest.toFixed(2)),
+      oiDelta5m: Number(oiDelta5m.toFixed(2)),
+      cvd5m: Number(cvd5m.toFixed(2)),
+      cvdRatio: Number(cvdRatio.toFixed(3)),
+      liquidationBurstSide,
+      liquidationVolume5m: Number(liquidationVolume5m.toFixed(2)),
     };
 
     this.indicatorsCache.set(symbol, snapshot);
@@ -530,6 +770,7 @@ class BinanceFeedService {
     if (this.ws) this.ws.close();
     if (this.reconnectTimeout) clearTimeout(this.reconnectTimeout);
     if (this.pollInterval) clearInterval(this.pollInterval);
+    if (this.oiPollInterval) clearInterval(this.oiPollInterval);
   }
 }
 

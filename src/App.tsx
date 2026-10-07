@@ -8,12 +8,13 @@ import { LeaderboardTab } from './components/LeaderboardTab';
 import { PositionsTab } from './components/PositionsTab';
 import { DebtBookTab } from './components/DebtBookTab';
 import { NewsFeedTab } from './components/NewsFeedTab';
+import { SicilTab } from './components/SicilTab';
 import { NegotiationModal } from './components/NegotiationModal';
 import { SettingsModal } from './components/SettingsModal';
-import { Users, Zap, BookOpen, Newspaper } from 'lucide-react';
+import { Users, Zap, BookOpen, Newspaper, ScrollText } from 'lucide-react';
 import confetti from 'canvas-confetti';
 
-type TabType = 'leaderboard' | 'positions' | 'debtbook' | 'news';
+type TabType = 'leaderboard' | 'positions' | 'debtbook' | 'news' | 'sicil';
 
 export default function App() {
   const [hasEntered, setHasEntered] = useState<boolean>(false);
@@ -149,11 +150,18 @@ export default function App() {
         )}
 
         {activeTab === 'news' && <NewsFeedTab news={engineState.newsFeed} />}
+
+        {activeTab === 'sicil' && (
+          <SicilTab
+            decisionLogs={engineState.decisionLogs}
+            traders={engineState.traders}
+          />
+        )}
       </main>
 
-      {/* Fixed Bottom Navigation Bar (Pattern 1 from Mobile Design Reference) */}
+      {/* Fixed Bottom Navigation Bar (5 Tabs) */}
       <nav className="fixed bottom-0 left-0 right-0 z-40 bg-white/90 backdrop-blur-md border-t border-purple-100 shadow-lg px-2 py-1">
-        <div className="max-w-md mx-auto grid grid-cols-4 items-center h-14">
+        <div className="max-w-md mx-auto grid grid-cols-5 items-center h-14">
           {/* Tab 1: Leaderboard */}
           <button
             onClick={() => {
@@ -166,10 +174,10 @@ export default function App() {
                 : 'text-slate-500 hover:text-slate-900'
             }`}
           >
-            <Users className="w-5 h-5" />
-            <span className="text-[10px] mt-0.5 tracking-tight">Mıntıka</span>
+            <Users className="w-4.5 h-4.5" />
+            <span className="text-[9px] mt-0.5 tracking-tight">Mıntıka</span>
             {pendingLoansCount > 0 && (
-              <span className="absolute top-1 right-3 w-2 h-2 rounded-full bg-pink-500 animate-ping" />
+              <span className="absolute top-1 right-2 w-2 h-2 rounded-full bg-pink-500 animate-ping" />
             )}
           </button>
 
@@ -185,10 +193,10 @@ export default function App() {
                 : 'text-slate-500 hover:text-slate-900'
             }`}
           >
-            <Zap className="w-5 h-5" />
-            <span className="text-[10px] mt-0.5 tracking-tight">Pozisyonlar</span>
+            <Zap className="w-4.5 h-4.5" />
+            <span className="text-[9px] mt-0.5 tracking-tight">Pozisyon</span>
             {engineState.openPositions.length > 0 && (
-              <span className="absolute top-1 right-2.5 text-[9px] font-mono font-bold bg-purple-100 text-purple-700 px-1 rounded-full">
+              <span className="absolute top-1 right-1.5 text-[8px] font-mono font-bold bg-purple-100 text-purple-700 px-1 rounded-full">
                 {engineState.openPositions.length}
               </span>
             )}
@@ -206,10 +214,10 @@ export default function App() {
                 : 'text-slate-500 hover:text-slate-900'
             }`}
           >
-            <BookOpen className="w-5 h-5" />
-            <span className="text-[10px] mt-0.5 tracking-tight">Borç Defteri</span>
+            <BookOpen className="w-4.5 h-4.5" />
+            <span className="text-[9px] mt-0.5 tracking-tight">Defter</span>
             {overdueLoansCount > 0 && (
-              <span className="absolute top-1 right-2 w-2 h-2 rounded-full bg-rose-500 animate-pulse" />
+              <span className="absolute top-1 right-1.5 w-2 h-2 rounded-full bg-rose-500 animate-pulse" />
             )}
           </button>
 
@@ -225,8 +233,29 @@ export default function App() {
                 : 'text-slate-500 hover:text-slate-900'
             }`}
           >
-            <Newspaper className="w-5 h-5" />
-            <span className="text-[10px] mt-0.5 tracking-tight">Çırak Haber</span>
+            <Newspaper className="w-4.5 h-4.5" />
+            <span className="text-[9px] mt-0.5 tracking-tight">Haber</span>
+          </button>
+
+          {/* Tab 5: Sicil (Performance Ledger) */}
+          <button
+            onClick={() => {
+              soundService.playClickSound();
+              setActiveTab('sicil');
+            }}
+            className={`min-h-[44px] flex flex-col items-center justify-center transition-colors relative ${
+              activeTab === 'sicil'
+                ? 'text-purple-700 font-bold'
+                : 'text-slate-500 hover:text-slate-900'
+            }`}
+          >
+            <ScrollText className="w-4.5 h-4.5" />
+            <span className="text-[9px] mt-0.5 tracking-tight">Sicil</span>
+            {engineState.decisionLogs.length > 0 && (
+              <span className="absolute top-1 right-1 text-[8px] font-mono font-bold bg-emerald-100 text-emerald-800 px-1 rounded-full">
+                {engineState.decisionLogs.length}
+              </span>
+            )}
           </button>
         </div>
       </nav>
